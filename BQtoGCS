@@ -1,0 +1,116 @@
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.text.ParseException;
+import com.moandjiezana.toml.Toml;
+import java.math.BigDecimal;
+
+import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
+import org.apache.beam.sdk.io.jdbc.JdbcIO;
+import org.apache.beam.sdk.options.Description;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.schemas.Schema;
+import org.apache.beam.sdk.schemas.Schema.FieldType;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.Row;
+
+import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.transforms.MapElements;
+import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.TypeDescriptor;
+
+import com.google.api.services.bigquery.model.TableRow;
+import java.time.ZonedDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+
+public class BQtoGCS {
+        private static final String APPCONFIG_FILE= "appconfig.toml";
+        
+        public interface MyOptions extends PipelineOptions {
+            @Description("Date format yyyyMMdd.")
+            String getEnv();
+            void setEnv(String env);
+          }
+        
+        @SuppressWarnings({ "serial" })
+        public static void main(String[] args) throws IOException, ParseException, SQLException {
+                //Pipeline p = Pipeline.create(PipelineOptionsFactory.fromArgs(args).withValidation().create());
+        PipelineOptionsFactory.register(MyOptions.class);
+        MyOptions options = PipelineOptionsFactory.fromArgs(args).withValidation().as(MyOptions.class);
+        Pipeline p = Pipeline.create(options);
+        String ENV = options.getEnv();
+                
+        ZoneId jakartaZoneId = ZoneId.of("Asia/Jakarta");
+        // Get the current date and time in Jakarta timezone
+        ZonedDateTime jakartaDateTime = ZonedDateTime.now(jakartaZoneId);
+        // Define the desired date format
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+        // Format the current date
+        String TODAY = jakartaDateTime.format(formatter);
+                /* Read appconfig file */
+                //Toml configToml = new Toml();
+                InputStream inputStream = new FileInputStream(APPCONFIG_FILE);
+                Toml configToml = new Toml().read(inputStream);
+
+        // Create the schema definition for big query
+        Schema bqSchema =
+                    Schema
+                      .builder()
+                      .addNullableField("COLUMN1", FieldType.STRING)
+                      .addNullableField("COLUMN2", FieldType.STRING)
+                      .addNullableField("COLUMN3", FieldType.STRING)
+                      .build();
+        
+        /* Read BQ */
+        PCollection<TableRow> sourceBQ = p.apply("Read BigQuery",BigQueryIO.readTableRows()
+                .fromQuery("SELECT " +
+                                "COLUMN1," +
+                                "COLUMN2," +
+                                "COLUMN3 " +                      
+                                "FROM " + "_bq_dataset.bq_tbl_name")
+                .usingStandardSql().withoutValidation());
+        
+               
+        // Convert TableRow to CSV-formatted strings
+        PCollection<String> csvData = sourceBQ.apply("ConvertToCSV", MapElements
+                .into(TypeDescriptor.of(String.class))
+                .via((TableRow row) -> {
+                    String COLUMN1 = row.get("COLUMN1")!= null ? row.get("COLUMN1").toString() : "NULL";
+                    String COLUMN2 = row.get("COLUMN2")!= null ? row.get("COLUMN2").toString() : "NULL";
+                    String COLUMN3 = row.get("COLUMN3")!= null ? row.get("COLUMN3").toString() : "NULL";
+                   
+                    // Enclose each field in double quotes and escape existing double quotes
+                    String csvRow = String.format(
+                        "\"%s\",\"%s\",\"%s\"",
+                        COLUMN1.replace("\"", "\"\""),
+                        COLUMN2.replace("\"", "\"\""),
+                        COLUMN3.replace("\"", "\"\"")
+                    );
+
+                    return csvRow;
+                })
+        );
+
+        // Write the CSV data to GCS
+        csvData.apply("WriteToGCS",
+                TextIO.write()
+                        .to("gs://gcs_bycket/"+"/csvName.csv")
+                        .withSuffix(".csv")
+                        .withHeader("\"COLUMN1\",\"COLUMN2\",\"COLUMN3\"")
+                        .withNumShards(1) // You can adjust the number of output shards as needed, should be 1 so data not split in shard inside bucket
+        );
+
+        p.run().waitUntilFinish();
+    }
+}

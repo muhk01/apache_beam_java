@@ -1,0 +1,155 @@
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.Serializable;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.Arrays;
+import java.util.TimeZone;
+
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+
+import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.values.PCollection;
+import org.apache.beam.sdk.values.Row;
+
+import com.datastax.driver.mapping.annotations.Column;
+import com.datastax.driver.mapping.annotations.PartitionKey;
+import com.datastax.driver.mapping.annotations.Table;
+import com.google.api.services.bigquery.model.TableRow;
+import com.moandjiezana.toml.Toml;
+
+import org.apache.beam.sdk.options.Description;
+import org.apache.beam.sdk.options.PipelineOptions;
+import org.apache.beam.sdk.options.PipelineOptionsFactory;
+import org.apache.beam.sdk.schemas.Schema;
+import org.apache.beam.sdk.schemas.Schema.FieldType;
+import org.apache.beam.sdk.transforms.DoFn;
+import org.apache.beam.sdk.transforms.ParDo;
+import org.apache.beam.sdk.io.cassandra.CassandraIO;
+import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
+import org.apache.beam.sdk.io.jdbc.JdbcIO;
+
+@SuppressWarnings("serial")
+@Table(keyspace = "cx_keyspace", name = "cx_tbl_name",
+readConsistency = "LOCAL_QUORUM",
+writeConsistency = "LOCAL_QUORUM",
+caseSensitiveKeyspace = false,
+caseSensitiveTable = false)
+class BQ_to_CXClass implements Serializable{
+
+        @PartitionKey
+        @Column(name="column1")
+        private String column1;
+         
+        @Column(name="column2")
+        private String column2;
+        
+        @Column(name="column3")
+        private String column3;
+     
+        
+
+
+        public BQ_to_CXClass(String column1, String column2, String column3) {
+                this.column1 = column1;
+                this.column2 = column2;
+                this.column3 = column3;
+             
+        }
+        
+        public String getcolumn1() { return column1; }
+        public void setcolumn1(String column1) { this.column1 = column1; }
+        
+        public String getcolumn2() { return column2; }
+        public void setcolumn2(String column2) { this.column2 = column2; }
+
+        public String getcolumn3() { return column3; }
+        public void setcolumn3(String column3) { this.column3 = column3; }
+        
+       
+        
+        
+}
+
+public class BQ_to_Cassandra {
+        
+        private static final String APPCONFIG_FILE= "appconfig.toml";
+        
+        public interface MyOptions extends PipelineOptions {
+            @Description("Environment : dev|qas|prd")
+            String getEnv();
+            void setEnv(String env);
+        }       
+        
+    @SuppressWarnings("serial")
+    public static void main(String[] args) throws IOException, SQLException {
+        
+        /* Create pipeline and environment variable */
+        PipelineOptionsFactory.register(MyOptions.class);
+        MyOptions options = PipelineOptionsFactory.fromArgs(args).withValidation().as(MyOptions.class);
+        Pipeline p = Pipeline.create(options);
+        String ENV = options.getEnv();
+        //String ENV = "prd";
+        /* Handle configuration file */
+        InputStream inputStream = new FileInputStream(APPCONFIG_FILE);
+                Toml configToml = new Toml().read(inputStream);
+                
+                String host_cxdb = configToml.getString("connection."+ ENV +"_cxdb.host");
+                String port_cxdb = configToml.getString("connection."+ ENV +"_cxdb.port");
+                String user_cxdb = configToml.getString("connection."+ ENV +"_cxdb.user");
+                String pass_cxdb = configToml.getString("connection."+ ENV +"_cxdb.pass");
+                String db_cxdb = configToml.getString("connection."+ ENV +"_cxdb.db");
+                
+                
+                /* Write d-1 only, unless CDC error in several days change query = into <= to load all data */
+                DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd");
+                dateFormat.setTimeZone(TimeZone.getTimeZone("UTC+7"));
+                Calendar cal = Calendar.getInstance();
+                // Subtract one day
+                cal.add(Calendar.DAY_OF_MONTH, -1);
+                String yyyymmdd = dateFormat.format(cal.getTime());
+                System.out.println(yyyymmdd);
+
+
+                /* For NoSQL, parse the hosts into a list */
+                String[] list_host_cxdb_datasource = host_cxdb.split(",");
+                
+                PCollection<TableRow> sourceBQ = p.apply("Read BigQuery",BigQueryIO.readTableRows()
+                .fromQuery("SELECT " +
+                                "column1," +
+                                "column2," +
+                                "column3" +
+                                "FROM " + "bq_project.bq_table")
+                                        .usingStandardSql().withoutValidation());
+        
+                
+        /* Write to cassandra */
+                sourceBQ.apply("Convert to Cxbq_to_cx",ParDo.of(new DoFn<TableRow, Cxbq_to_cx>() {
+            @ProcessElement
+            public void processElement(ProcessContext c) throws Exception{
+                    TableRow row = c.element();
+                    String column1 = (String) row.get("column1");
+                    String column2 = (String) row.get("column2");
+                    String column3 = (String) row.get("column3");
+                    
+                    Cxbq_to_cx trow = new Cxbq_to_cx(column1, column2, column3);
+                    c.output(trow);
+            }
+        })).apply("Write "+ db_cxdb +".cx_tb_name",CassandraIO.<Cxbq_to_cx>write()
+                .withHosts(Arrays.asList(list_host_cxdb_datasource)) // this is a list: value1, value2, ...
+                .withPort(Integer.parseInt(port_cxdb))
+                .withUsername(user_cxdb)
+                .withPassword(pass_cxdb)
+                .withKeyspace(db_cxdb)
+                .withEntity(Cxbq_to_cx.class));
+
+        p.run();
+    }
+}
